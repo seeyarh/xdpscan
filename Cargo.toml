@@ -7,3 +7,19 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+xsk-rs = { path = "/home/ch/src/github.com/seeyarh/xsk-rs" }
+bitflags = "1.2.1"
+libbpf-sys = "0.3.0-1"
+libc = "0.2"
+log = "0.4"
+errno = "0.2"
+etherparse = "0.9.0"
+
+[dev-dependencies]
+clap = "2.33.3"
+crossbeam-channel = "0.5.0"
+ctrlc = "3.1.7"
+rand = "0.7.3"
+env_logger = "0.8.2"
+serial_test = "0.5.1"
+utilities = { path = "utilities" }
