@@ -4,6 +4,7 @@ mod send;
 use std::cmp;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
+use std::thread;
 
 use etherparse::PacketBuilder;
 use xsk_rs::{
@@ -11,31 +12,73 @@ use xsk_rs::{
     BindFlags, LibbpfFlags, XdpFlags,
 };
 
+pub struct Target {
+    pub ip: IpAddr,
+    pub port: u16,
+}
+
 fn generate_eth_frame(
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
-    src_ip: Ipv4Addr,
-    dst_ip: Ipv4Addr,
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
 ) -> Vec<u8> {
-    let builder = PacketBuilder::ethernet2(src_mac, dst_mac)
-        .ipv4(
-            src_ip.octets(), // src ip
-            dst_ip.octets(), // dst ip
-            20,              // time to live
-        )
-        .udp(
-            1234, // src port
-            1234, // dst port
-        );
+    let builder = PacketBuilder::ethernet2(src_mac, dst_mac);
 
-    let mut result = Vec::<u8>::with_capacity(builder.size(0));
+    if src_ip.is_ipv6() || dst_ip.is_ipv6() {
+        let src_ip = match src_ip {
+            IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+            IpAddr::V6(ipv6) => ipv6,
+        };
+        let dst_ip = match dst_ip {
+            IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
+            IpAddr::V6(ipv6) => ipv6,
+        };
 
-    builder.write(&mut result, &[]).unwrap();
-
-    result
+        let builder = builder
+            .ipv6(src_ip.octets(), dst_ip.octets(), 20)
+            .tcp(src_port, dst_port, 0, 4)
+            .syn();
+        let mut result = Vec::<u8>::with_capacity(builder.size(0));
+        builder.write(&mut result, &[]).unwrap();
+        result
+    } else {
+        let src_ip = match src_ip {
+            IpAddr::V4(ipv4) => ipv4,
+            IpAddr::V6(ipv6) => ipv6
+                .to_ipv4()
+                .expect("Failed to convert ipv6 to ipv4, this shouldn't happen"),
+        };
+        let dst_ip = match dst_ip {
+            IpAddr::V4(ipv4) => ipv4,
+            IpAddr::V6(ipv6) => ipv6
+                .to_ipv4()
+                .expect("Failed to convert ipv6 to ipv4, this shouldn't happen"),
+        };
+        let builder = builder
+            .ipv4(
+                src_ip.octets(), // src ip
+                dst_ip.octets(), // dst ip
+                20,              // time to live
+            )
+            .tcp(src_port, dst_port, 0, 4)
+            .syn();
+        let mut result = Vec::<u8>::with_capacity(builder.size(0));
+        builder.write(&mut result, &[]).unwrap();
+        result
+    }
 }
 
-pub fn run_scan(ifname: &str) {
+pub fn run_scan(
+    ifname: &str,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    src_ip: IpAddr,
+    src_port: u16,
+    targets: Vec<Target>,
+) {
     let rx_q_size: u32 = 4096;
     let tx_q_size: u32 = 4096;
     let comp_q_size: u32 = 4096;
@@ -70,34 +113,27 @@ pub fn run_scan(ifname: &str) {
     // Populate tx queue
     let frames = &mut dev.frame_descs;
 
-    // Copy over some bytes to devs umem to transmit
-    let eth_frame = generate_eth_frame(
-        [0xf6, 0xe0, 0xf6, 0xc9, 0x60, 0x0a],
-        [0x4a, 0xf1, 0x30, 0xeb, 0x0d, 0x31],
-        Ipv4Addr::new(192, 168, 69, 1),
-        Ipv4Addr::new(192, 168, 69, 2),
-    );
+    for (i, target) in targets.iter().enumerate() {
+        // Copy over some bytes to devs umem to transmit
+        let eth_frame =
+            generate_eth_frame(src_mac, dst_mac, src_ip, src_port, target.ip, target.port);
 
-    match etherparse::PacketHeaders::from_ethernet_slice(&eth_frame) {
-        Err(value) => println!("Err {:?}", value),
-        Ok(value) => {
-            println!("link: {:?}", value.link);
-            println!("ip: {:?}", value.ip);
-            println!("transport: {:?}", value.transport);
-        }
+        unsafe {
+            dev.umem
+                .write_to_umem_checked(&mut frames[i], &eth_frame)
+                .unwrap()
+        };
+
+        assert_eq!(frames[0].len(), eth_frame.len());
     }
-
-    unsafe {
-        dev.umem
-            .write_to_umem_checked(&mut frames[0], &eth_frame)
-            .unwrap()
-    };
-
-    assert_eq!(frames[0].len(), eth_frame.len());
 
     // 3. Hand over the frame to the kernel for transmission
     assert_eq!(
-        unsafe { dev.tx_q.produce_and_wakeup(&frames[..1]).unwrap() },
+        unsafe {
+            dev.tx_q
+                .produce_and_wakeup(&frames[..targets.len()])
+                .unwrap()
+        },
         1
     );
 }
