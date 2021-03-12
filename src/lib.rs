@@ -1,5 +1,7 @@
 mod recv;
 mod send;
+use recv::recv;
+use send::send;
 
 use std::cmp;
 use std::net::{IpAddr, Ipv4Addr};
@@ -17,72 +19,18 @@ pub struct Target {
     pub port: u16,
 }
 
-fn generate_eth_frame(
-    src_mac: [u8; 6],
-    dst_mac: [u8; 6],
-    src_ip: IpAddr,
-    src_port: u16,
-    dst_ip: IpAddr,
-    dst_port: u16,
-) -> Vec<u8> {
-    let builder = PacketBuilder::ethernet2(src_mac, dst_mac);
-
-    if src_ip.is_ipv6() || dst_ip.is_ipv6() {
-        let src_ip = match src_ip {
-            IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
-            IpAddr::V6(ipv6) => ipv6,
-        };
-        let dst_ip = match dst_ip {
-            IpAddr::V4(ipv4) => ipv4.to_ipv6_mapped(),
-            IpAddr::V6(ipv6) => ipv6,
-        };
-
-        let builder = builder
-            .ipv6(src_ip.octets(), dst_ip.octets(), 20)
-            .tcp(src_port, dst_port, 0, 4)
-            .syn();
-        let mut result = Vec::<u8>::with_capacity(builder.size(0));
-        builder.write(&mut result, &[]).unwrap();
-        result
-    } else {
-        let src_ip = match src_ip {
-            IpAddr::V4(ipv4) => ipv4,
-            IpAddr::V6(ipv6) => ipv6
-                .to_ipv4()
-                .expect("Failed to convert ipv6 to ipv4, this shouldn't happen"),
-        };
-        let dst_ip = match dst_ip {
-            IpAddr::V4(ipv4) => ipv4,
-            IpAddr::V6(ipv6) => ipv6
-                .to_ipv4()
-                .expect("Failed to convert ipv6 to ipv4, this shouldn't happen"),
-        };
-        let builder = builder
-            .ipv4(
-                src_ip.octets(), // src ip
-                dst_ip.octets(), // dst ip
-                20,              // time to live
-            )
-            .tcp(src_port, dst_port, 0, 4)
-            .syn();
-        let mut result = Vec::<u8>::with_capacity(builder.size(0));
-        builder.write(&mut result, &[]).unwrap();
-        result
-    }
+pub struct SrcConfig {
+    pub src_mac: [u8; 6],
+    pub dst_mac: [u8; 6],
+    pub src_ip: IpAddr,
+    pub src_port: u16,
 }
 
-pub fn run_scan(
-    ifname: &str,
-    src_mac: [u8; 6],
-    dst_mac: [u8; 6],
-    src_ip: IpAddr,
-    src_port: u16,
-    targets: Vec<Target>,
-) {
+pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
     let rx_q_size: u32 = 4096;
     let tx_q_size: u32 = 4096;
     let comp_q_size: u32 = 4096;
-    let fill_q_size: u32 = 4096 * 4;
+    let fill_q_size: u32 = 4096;
     let frame_size: u32 = 2048;
     let max_batch_size: usize = 64;
     let num_frames_to_send: usize = 64;
@@ -108,32 +56,28 @@ pub fn run_scan(
     )
     .unwrap();
 
-    let mut dev = build_socket_and_umem(umem_config, socket_config, &ifname, 0);
+    let dev = build_socket_and_umem(umem_config, socket_config, &ifname, 0);
 
-    // Populate tx queue
-    let frames = &mut dev.frame_descs;
+    let n_tx_frames = dev.frame_descs.len() / 2;
+    let tx_frames = dev.frame_descs[..n_tx_frames].into();
+    let rx_frames = dev.frame_descs[n_tx_frames..].into();
 
-    for (i, target) in targets.iter().enumerate() {
-        // Copy over some bytes to devs umem to transmit
-        let eth_frame =
-            generate_eth_frame(src_mac, dst_mac, src_ip, src_port, target.ip, target.port);
+    let tx_q = dev.tx_q;
+    let rx_q = dev.rx_q;
+    let comp_q = dev.comp_q;
+    let fill_q = dev.fill_q;
 
-        unsafe {
-            dev.umem
-                .write_to_umem_checked(&mut frames[i], &eth_frame)
-                .unwrap()
-        };
+    let tx_umem = dev.umem;
+    let rx_umem = tx_umem.clone();
 
-        assert_eq!(frames[0].len(), eth_frame.len());
-    }
+    let send_handle = thread::spawn(|| {
+        send(targets, src_config, tx_q, comp_q, tx_frames, tx_umem);
+    });
 
-    // 3. Hand over the frame to the kernel for transmission
-    assert_eq!(
-        unsafe {
-            dev.tx_q
-                .produce_and_wakeup(&frames[..targets.len()])
-                .unwrap()
-        },
-        1
-    );
+    let recv_handle = thread::spawn(|| {
+        recv(rx_q, fill_q, rx_frames, rx_umem);
+    });
+
+    send_handle.join().unwrap();
+    recv_handle.join().unwrap();
 }

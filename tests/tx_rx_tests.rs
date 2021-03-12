@@ -1,4 +1,5 @@
 extern crate utilities;
+use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
 use utilities::veth_setup::{cleanup_veth, setup_veth, LinkIpAddr, VethConfig, VethLink};
@@ -15,16 +16,16 @@ use xsk_rs::{
 use std::thread;
 use std::time::Duration;
 
-use xdpscan::Target;
+use xdpscan::{SrcConfig, Target};
 
 fn check_packet_match(
-    value: etherparse::PacketHeaders,
+    value: &etherparse::PacketHeaders,
     expected_src: Ipv4Addr,
     expected_dst: Ipv4Addr,
 ) -> bool {
     if let Some(ip) = &value.ip {
         if let etherparse::IpHeader::Version4(ipv4) = &ip {
-            println!("recvd frame");
+            println!("received frame in test receiver");
             println!("link: {:?}", value.link);
             println!("ip: {:?}", &value.ip);
             println!("transport: {:?}", value.transport);
@@ -87,6 +88,7 @@ fn recv(dev: &mut Xsk, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) {
                     frames_rcvd
                 );
 
+                let mut resp_frames = vec![];
                 for recv_frame in dev.frame_descs.iter().take(frames_rcvd) {
                     let frame_ref = unsafe {
                         dev.umem
@@ -97,50 +99,53 @@ fn recv(dev: &mut Xsk, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) {
                     match etherparse::PacketHeaders::from_ethernet_slice(&frame_ref) {
                         Err(value) => println!("Err {:?}", value),
                         Ok(value) => {
-                            if check_packet_match(value, src_ip, dst_ip) {
+                            if check_packet_match(&value, src_ip, dst_ip) {
                                 matching_frames_rcvd += 1;
                                 let resp_frame = generate_synack_frame_resp(value);
-
-                                unsafe {
-                                    dev.umem
-                                        .write_to_umem_checked(&mut dev.frame_descs[0], &resp_frame)
-                                        .unwrap();
-                                };
-                                unsafe {
-                                    dev.tx_q.produce_and_wakeup(&dev.frame_descs[..1]).unwrap();
-                                };
+                                resp_frames.push(resp_frame);
                             }
                         }
                     }
-                    // Add frames back to fill queue
-                    while unsafe {
-                        dev.fill_q
-                            .produce_and_wakeup(
-                                &dev.frame_descs[..frames_rcvd],
-                                dev.rx_q.fd(),
-                                poll_ms_timeout,
-                            )
-                            .unwrap()
-                    } != frames_rcvd
-                    {
-                        // Loop until frames added to the fill ring.
-                        eprintln!("(dev) dev.fill_q.produce_and_wakeup() failed to allocate");
-                    }
-
-                    eprintln!(
-                        "(dev) dev.fill_q.produce_and_wakeup() submitted {} frames",
-                        frames_rcvd
-                    );
-
-                    total_frames_rcvd += frames_rcvd;
-                    eprintln!("(dev) total frames received: {}", total_frames_rcvd);
                 }
+
+                for resp_frame in resp_frames {
+                    unsafe {
+                        dev.umem
+                            .write_to_umem_checked(&mut dev.frame_descs[0], &resp_frame)
+                            .unwrap();
+                    };
+                    unsafe {
+                        dev.tx_q.produce_and_wakeup(&dev.frame_descs[..1]).unwrap();
+                    };
+                }
+                // Add frames back to fill queue
+                while unsafe {
+                    dev.fill_q
+                        .produce_and_wakeup(
+                            &dev.frame_descs[..frames_rcvd],
+                            dev.rx_q.fd(),
+                            poll_ms_timeout,
+                        )
+                        .unwrap()
+                } != frames_rcvd
+                {
+                    // Loop until frames added to the fill ring.
+                    eprintln!("(dev) dev.fill_q.produce_and_wakeup() failed to allocate");
+                }
+
+                eprintln!(
+                    "(dev) dev.fill_q.produce_and_wakeup() submitted {} frames",
+                    frames_rcvd
+                );
+
+                total_frames_rcvd += frames_rcvd;
+                eprintln!("(dev) total frames received: {}", total_frames_rcvd);
             }
         }
     }
 }
 
-fn run_test(veth_link: &VethLink) {
+fn run_test(veth_link: &VethLink) -> Result<(), Box<dyn Error>> {
     let rx_q_size: u32 = 4096;
     let tx_q_size: u32 = 4096;
     let comp_q_size: u32 = 4096;
@@ -185,20 +190,20 @@ fn run_test(veth_link: &VethLink) {
         port: 1234,
     }];
 
-    xdpscan::run_scan(
-        &veth_link.dev1_if_name,
+    let src_config = SrcConfig {
         src_mac,
         dst_mac,
         src_ip,
         src_port,
-        targets,
-    );
+    };
+    xdpscan::start_scan(&veth_link.dev1_if_name, src_config, targets);
 
     recv_handle.join().expect("failed to join recv handle");
+    Ok(())
 }
 
 #[test]
-fn tx_rx_test() {
+fn tx_rx_test() -> Result<(), Box<dyn Error>> {
     let veth_config = VethConfig::new(
         "veth0".into(),
         "veth1".into(),
@@ -210,4 +215,5 @@ fn tx_rx_test() {
     let (veth_link, mut rt) = setup_veth(&veth_config);
     let passed = run_test(&veth_link);
     cleanup_veth(&veth_link, &mut rt);
+    passed
 }
