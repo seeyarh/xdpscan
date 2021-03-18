@@ -62,9 +62,16 @@ pub fn send(
     src_config: SrcConfig,
     mut tx_q: TxQueue,
     mut _comp_q: CompQueue,
-    mut frame_descs: Vec<FrameDesc>,
+    mut frames: Vec<FrameDesc>,
     mut umem: Umem,
 ) {
+    eprint!("--------------------------");
+    eprintln!(
+        "tx frames[0] = {}, tx frames[-1] = {}",
+        frames[0].addr(),
+        frames[frames.len() - 1].addr()
+    );
+    eprint!("--------------------------");
     for (i, target) in targets.iter().enumerate() {
         // Copy over some bytes to devs umem to transmit
         let eth_frame = generate_eth_frame(
@@ -77,19 +84,16 @@ pub fn send(
         );
 
         unsafe {
-            umem.write_to_umem_checked(&mut frame_descs[i], &eth_frame)
+            umem.write_to_umem_checked(&mut frames[i], &eth_frame)
                 .unwrap()
         };
 
-        assert_eq!(frame_descs[0].len(), eth_frame.len());
+        assert_eq!(frames[0].len(), eth_frame.len());
     }
 
     // 3. Hand over the frame to the kernel for transmission
     assert_eq!(
-        unsafe {
-            tx_q.produce_and_wakeup(&frame_descs[..targets.len()])
-                .unwrap()
-        },
+        unsafe { tx_q.produce_and_wakeup(&frames[..targets.len()]).unwrap() },
         1
     );
 }

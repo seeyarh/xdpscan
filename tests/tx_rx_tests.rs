@@ -6,10 +6,10 @@ use utilities::veth_setup::{cleanup_veth, setup_veth, LinkIpAddr, VethConfig, Ve
 
 use etherparse::PacketBuilder;
 use serial_test::serial;
+
 use xsk_rs::{
-    socket::{Config as SocketConfig, ConfigBuilder as SocketConfigBuilder},
-    umem::{Config as UmemConfig, ConfigBuilder as UmemConfigBuilder},
-    xsk::{build_socket_and_umem, Xsk},
+    socket::{Config as SocketConfig, *},
+    umem::{Config as UmemConfig, *},
     BindFlags, LibbpfFlags, XdpFlags,
 };
 
@@ -55,12 +55,26 @@ fn generate_synack_frame_resp(value: etherparse::PacketHeaders) -> Vec<u8> {
     result
 }
 
-fn recv(dev: &mut Xsk, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) {
+fn recv(
+    mut fill_q: xsk_rs::FillQueue,
+    mut _comp_q: xsk_rs::CompQueue,
+    mut tx_q: xsk_rs::TxQueue,
+    mut rx_q: xsk_rs::RxQueue,
+    mut frames: Vec<xsk_rs::FrameDesc>,
+    mut umem: xsk_rs::Umem,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+) {
     // 1. Add frames to dev2's FillQueue
-    assert_eq!(
-        unsafe { dev.fill_q.produce(&dev.frame_descs[..]) },
-        dev.frame_descs.len()
+    //assert_eq!(unsafe { fill_q.produce(&frames[..]) }, frames.len());
+    unsafe { fill_q.produce(&frames[1..2]) };
+    eprintln!("--------------------------");
+    eprintln!(
+        "test receiver rx frames[0] = {}, rx frames[-1] = {}",
+        frames[0].addr(),
+        frames[frames.len() - 1].addr()
     );
+    eprintln!("--------------------------");
 
     let mut total_frames_rcvd = 0;
     let mut matching_frames_rcvd = 0;
@@ -69,17 +83,16 @@ fn recv(dev: &mut Xsk, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) {
 
     while matching_frames_rcvd < num_frames_sent {
         eprintln!("starting rx loop");
-        match dev
-            .rx_q
-            .poll_and_consume(&mut dev.frame_descs[..], poll_ms_timeout)
+        match rx_q
+            .poll_and_consume(&mut frames[..], poll_ms_timeout)
             .unwrap()
         {
             0 => {
                 eprintln!("(dev) dev.rx_q.poll_and_consume() consumed 0 frames");
                 // No packets consumed, wake up fill queue if required
-                if dev.fill_q.needs_wakeup() {
+                if fill_q.needs_wakeup() {
                     eprintln!("(dev) waking up dev.fill_q");
-                    dev.fill_q.wakeup(dev.rx_q.fd(), poll_ms_timeout).unwrap();
+                    fill_q.wakeup(rx_q.fd(), poll_ms_timeout).unwrap();
                 }
             }
             frames_rcvd => {
@@ -89,12 +102,16 @@ fn recv(dev: &mut Xsk, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) {
                 );
 
                 let mut resp_frames = vec![];
-                for recv_frame in dev.frame_descs.iter().take(frames_rcvd) {
+                for recv_frame in frames.iter().take(frames_rcvd) {
                     let frame_ref = unsafe {
-                        dev.umem
-                            .read_from_umem_checked(&recv_frame.addr(), &recv_frame.len())
+                        umem.read_from_umem_checked(&recv_frame.addr(), &recv_frame.len())
                             .unwrap()
                     };
+                    eprintln!(
+                        "\ntest receiver: recv frame addr = {}, len = {}\n",
+                        recv_frame.addr(),
+                        recv_frame.len()
+                    );
 
                     match etherparse::PacketHeaders::from_ethernet_slice(&frame_ref) {
                         Err(value) => println!("Err {:?}", value),
@@ -109,23 +126,19 @@ fn recv(dev: &mut Xsk, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) {
                 }
 
                 for resp_frame in resp_frames {
+                    eprintln!("test receiver resp frame len = {}", resp_frame.len());
                     unsafe {
-                        dev.umem
-                            .write_to_umem_checked(&mut dev.frame_descs[0], &resp_frame)
+                        umem.write_to_umem_checked(&mut frames[0], &resp_frame)
                             .unwrap();
                     };
                     unsafe {
-                        dev.tx_q.produce_and_wakeup(&dev.frame_descs[..1]).unwrap();
+                        tx_q.produce_and_wakeup(&frames[..1]).unwrap();
                     };
                 }
                 // Add frames back to fill queue
                 while unsafe {
-                    dev.fill_q
-                        .produce_and_wakeup(
-                            &dev.frame_descs[..frames_rcvd],
-                            dev.rx_q.fd(),
-                            poll_ms_timeout,
-                        )
+                    fill_q
+                        .produce_and_wakeup(&frames[..frames_rcvd], rx_q.fd(), poll_ms_timeout)
                         .unwrap()
                 } != frames_rcvd
                 {
@@ -153,6 +166,7 @@ fn run_test(veth_link: &VethLink) -> Result<(), Box<dyn Error>> {
     let frame_size: u32 = 2048;
     let frame_count = 1024;
     let poll_ms_timeout: i32 = 100;
+    let queue_id = 0;
 
     let umem_config = UmemConfig::new(
         NonZeroU32::new(frame_count).unwrap(),
@@ -164,6 +178,12 @@ fn run_test(veth_link: &VethLink) -> Result<(), Box<dyn Error>> {
     )
     .unwrap();
 
+    let (mut umem, fill_q, comp_q, frames) = Umem::builder(umem_config)
+        .create_mmap()
+        .expect("failed to create mmap area")
+        .create_umem()
+        .expect("failed to create umem");
+
     let socket_config = SocketConfig::new(
         rx_q_size,
         tx_q_size,
@@ -173,7 +193,8 @@ fn run_test(veth_link: &VethLink) -> Result<(), Box<dyn Error>> {
     )
     .unwrap();
 
-    let mut dev2 = build_socket_and_umem(umem_config, socket_config, &veth_link.dev2_if_name, 0);
+    let (tx_q, rx_q) = Socket::new(socket_config, &mut umem, &veth_link.dev2_if_name, queue_id)
+        .expect("failed to build socket");
 
     let src_mac = [0xf6, 0xe0, 0xf6, 0xc9, 0x60, 0x0a];
     let dst_mac = [0x4a, 0xf1, 0x30, 0xeb, 0x0d, 0x31];
@@ -183,7 +204,8 @@ fn run_test(veth_link: &VethLink) -> Result<(), Box<dyn Error>> {
     let dst_ipv4 = Ipv4Addr::new(192, 168, 69, 2);
     let dst_ip = IpAddr::V4(dst_ipv4);
 
-    let recv_handle = thread::spawn(move || recv(&mut dev2, src_ipv4, dst_ipv4));
+    let recv_handle =
+        thread::spawn(move || recv(fill_q, comp_q, tx_q, rx_q, frames, umem, src_ipv4, dst_ipv4));
 
     let targets = vec![Target {
         ip: dst_ip,
@@ -215,5 +237,6 @@ fn tx_rx_test() -> Result<(), Box<dyn Error>> {
     let (veth_link, mut rt) = setup_veth(&veth_config);
     let passed = run_test(&veth_link);
     cleanup_veth(&veth_link, &mut rt);
+    assert!(false);
     passed
 }

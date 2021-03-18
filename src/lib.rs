@@ -10,7 +10,8 @@ use std::thread;
 
 use etherparse::PacketBuilder;
 use xsk_rs::{
-    socket, socket::Config as SocketConfig, umem::Config as UmemConfig, xsk::build_socket_and_umem,
+    socket::{Config as SocketConfig, *},
+    umem::{Config as UmemConfig, *},
     BindFlags, LibbpfFlags, XdpFlags,
 };
 
@@ -30,12 +31,12 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
     let rx_q_size: u32 = 4096;
     let tx_q_size: u32 = 4096;
     let comp_q_size: u32 = 4096;
-    let fill_q_size: u32 = 4096;
+    let fill_q_size: u32 = 4096 * 2;
     let frame_size: u32 = 2048;
     let max_batch_size: usize = 64;
     let num_frames_to_send: usize = 64;
     let poll_ms_timeout: i32 = 100;
-    let frame_count = fill_q_size + comp_q_size;
+    let frame_count = rx_q_size + tx_q_size;
 
     let umem_config = UmemConfig::new(
         NonZeroU32::new(frame_count).unwrap(),
@@ -47,6 +48,12 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
     )
     .unwrap();
 
+    let (mut umem, fq, cq, frames) = Umem::builder(umem_config)
+        .create_mmap()
+        .expect("failed to create mmap area")
+        .create_umem()
+        .expect("failed to create umem");
+
     let socket_config = SocketConfig::new(
         rx_q_size,
         tx_q_size,
@@ -56,26 +63,20 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
     )
     .unwrap();
 
-    let dev = build_socket_and_umem(umem_config, socket_config, &ifname, 0);
+    let queue_id = 0;
+    let (tx_q, rx_q) =
+        Socket::new(socket_config, &mut umem, ifname, queue_id).expect("failed to build socket");
 
-    let n_tx_frames = dev.frame_descs.len() / 2;
-    let tx_frames = dev.frame_descs[..n_tx_frames].into();
-    let rx_frames = dev.frame_descs[n_tx_frames..].into();
+    let n_tx_frames = frames.len() / 2;
 
-    let tx_q = dev.tx_q;
-    let rx_q = dev.rx_q;
-    let comp_q = dev.comp_q;
-    let fill_q = dev.fill_q;
-
-    let tx_umem = dev.umem;
-    let rx_umem = tx_umem.clone();
+    let (rx_umem, tx_umem, rx_frames, tx_frames) = umem.split(frames, n_tx_frames as usize);
 
     let send_handle = thread::spawn(|| {
-        send(targets, src_config, tx_q, comp_q, tx_frames, tx_umem);
+        send(targets, src_config, tx_q, cq, tx_frames, tx_umem);
     });
 
     let recv_handle = thread::spawn(|| {
-        recv(rx_q, fill_q, rx_frames, rx_umem);
+        recv(rx_q, fq, rx_frames, rx_umem);
     });
 
     send_handle.join().unwrap();

@@ -1,10 +1,15 @@
 use xsk_rs::{FillQueue, FrameDesc, RxQueue, Umem};
 
-pub fn recv(mut rx_q: RxQueue, mut fill_q: FillQueue, mut frame_descs: Vec<FrameDesc>, umem: Umem) {
-    assert_eq!(
-        unsafe { fill_q.produce(&frame_descs[..]) },
-        frame_descs.len()
+pub fn recv(mut rx_q: RxQueue, mut fill_q: FillQueue, mut frames: Vec<FrameDesc>, umem: Umem) {
+    eprintln!("--------------------------");
+    eprintln!(
+        "rx frames[0] = {}, rx frames[-1] = {}",
+        frames[0].addr(),
+        frames[frames.len() - 1].addr()
     );
+    eprintln!("--------------------------");
+    //assert_eq!(unsafe { fill_q.produce(&frames[..]) }, frames.len());
+    unsafe { fill_q.produce(&frames[..1]) };
     let mut done = false;
 
     let poll_ms_timeout: i32 = 100;
@@ -13,7 +18,7 @@ pub fn recv(mut rx_q: RxQueue, mut fill_q: FillQueue, mut frame_descs: Vec<Frame
     while !done {
         eprintln!("starting rx loop");
         match rx_q
-            .poll_and_consume(&mut frame_descs[..], poll_ms_timeout)
+            .poll_and_consume(&mut frames[..], poll_ms_timeout)
             .unwrap()
         {
             0 => {
@@ -27,11 +32,16 @@ pub fn recv(mut rx_q: RxQueue, mut fill_q: FillQueue, mut frame_descs: Vec<Frame
             frames_rcvd => {
                 eprintln!("rx_q.poll_and_consume() consumed {} frames", frames_rcvd);
 
-                for recv_frame in frame_descs.iter().take(frames_rcvd) {
+                for recv_frame in frames.iter().take(frames_rcvd) {
                     let frame_ref = unsafe {
                         umem.read_from_umem_checked(&recv_frame.addr(), &recv_frame.len())
                             .unwrap()
                     };
+                    eprintln!(
+                        "recv frame addr = {}, len = {}",
+                        recv_frame.addr(),
+                        recv_frame.len()
+                    );
 
                     match etherparse::PacketHeaders::from_ethernet_slice(&frame_ref) {
                         Err(value) => println!("Err {:?}", value),
@@ -41,11 +51,16 @@ pub fn recv(mut rx_q: RxQueue, mut fill_q: FillQueue, mut frame_descs: Vec<Frame
                         }
                     }
                 }
+                eprintln!(
+                    "rx frames[0] = {}, rx frames[-1] = {}",
+                    frames[0].addr(),
+                    frames[frames.len() - 1].addr()
+                );
 
                 // Add frames back to fill queue
                 while unsafe {
                     fill_q
-                        .produce_and_wakeup(&frame_descs[..frames_rcvd], rx_q.fd(), poll_ms_timeout)
+                        .produce_and_wakeup(&frames[..frames_rcvd], rx_q.fd(), poll_ms_timeout)
                         .unwrap()
                 } != frames_rcvd
                 {
@@ -61,7 +76,7 @@ pub fn recv(mut rx_q: RxQueue, mut fill_q: FillQueue, mut frame_descs: Vec<Frame
                 total_frames_rcvd += frames_rcvd;
                 eprintln!("total frames received: {}", total_frames_rcvd);
 
-                if total_frames_rcvd > 1 {
+                if total_frames_rcvd > 3 {
                     done = true;
                 }
             }
