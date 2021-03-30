@@ -6,6 +6,11 @@ use send::send;
 use std::cmp;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroU32;
+use std::sync::atomic::AtomicBool;
+use std::time;
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread;
 
 use etherparse::PacketBuilder;
@@ -37,6 +42,7 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
     let num_frames_to_send: usize = 64;
     let poll_ms_timeout: i32 = 100;
     let frame_count = rx_q_size + tx_q_size;
+    let wait_time_secs = 8;
 
     let umem_config = UmemConfig::new(
         NonZeroU32::new(frame_count).unwrap(),
@@ -69,16 +75,23 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
 
     let n_tx_frames = frames.len() / 2;
 
-    let (rx_umem, tx_umem, rx_frames, tx_frames) = umem.split(frames, n_tx_frames as usize);
+    let (tx_umem, rx_umem, tx_frames, rx_frames) = umem.split(frames, n_tx_frames as usize);
+
+    let tx_done = Arc::new(AtomicBool::new(false));
+    let rx_done = tx_done.clone();
 
     let send_handle = thread::spawn(|| {
         send(targets, src_config, tx_q, cq, tx_frames, tx_umem);
     });
 
     let recv_handle = thread::spawn(|| {
-        recv(rx_q, fq, rx_frames, rx_umem);
+        recv(rx_q, fq, rx_frames, rx_umem, rx_done);
     });
 
     send_handle.join().unwrap();
+
+    thread::sleep(time::Duration::from_secs(wait_time_secs));
+    tx_done.store(true, Ordering::Relaxed);
+
     recv_handle.join().unwrap();
 }

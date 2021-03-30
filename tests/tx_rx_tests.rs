@@ -67,7 +67,7 @@ fn recv(
 ) {
     // 1. Add frames to dev2's FillQueue
     //assert_eq!(unsafe { fill_q.produce(&frames[..]) }, frames.len());
-    unsafe { fill_q.produce(&frames[1..2]) };
+    unsafe { fill_q.produce(&frames[..]) };
     eprintln!("--------------------------");
     eprintln!(
         "test receiver rx frames[0] = {}, rx frames[-1] = {}",

@@ -65,13 +65,15 @@ pub fn send(
     mut frames: Vec<FrameDesc>,
     mut umem: Umem,
 ) {
-    eprint!("--------------------------");
+    eprintln!("--------------------------");
     eprintln!(
         "tx frames[0] = {}, tx frames[-1] = {}",
         frames[0].addr(),
         frames[frames.len() - 1].addr()
     );
-    eprint!("--------------------------");
+    eprintln!("--------------------------");
+
+    let mut free_frames = frames.len();
     for (i, target) in targets.iter().enumerate() {
         // Copy over some bytes to devs umem to transmit
         let eth_frame = generate_eth_frame(
@@ -89,11 +91,22 @@ pub fn send(
         };
 
         assert_eq!(frames[0].len(), eth_frame.len());
+
+        free_frames -= 1;
+
+        if free_frames == 0 {
+            unsafe {
+                tx_q.produce_and_wakeup(&frames[..])
+                    .expect("failed to produce targets")
+            };
+            let free_frames = frames.len();
+        }
     }
 
-    // 3. Hand over the frame to the kernel for transmission
-    assert_eq!(
-        unsafe { tx_q.produce_and_wakeup(&frames[..targets.len()]).unwrap() },
-        1
-    );
+    if free_frames != frames.len() {
+        unsafe {
+            tx_q.produce_and_wakeup(&frames[..frames.len() - free_frames])
+                .expect("failed to produce targets")
+        };
+    }
 }
