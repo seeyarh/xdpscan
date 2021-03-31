@@ -1,6 +1,29 @@
+use crate::Target;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::Ordering;
 use std::sync::{atomic::AtomicBool, Arc};
 use xsk_rs::{FillQueue, FrameDesc, RxQueue, Umem};
+
+fn parse_response(value: &etherparse::PacketHeaders) -> Option<Target> {
+    let ip_hdr = value.ip.as_ref()?;
+    eprintln!("parse: ip_hdr = {:?}", ip_hdr);
+    let src_ip = match ip_hdr {
+        etherparse::IpHeader::Version4(ipv4_hdr) => IpAddr::V4(ipv4_hdr.source.into()),
+        etherparse::IpHeader::Version6(ipv6_hdr) => IpAddr::V6(ipv6_hdr.destination.into()),
+    };
+
+    let transport_hdr = value.transport.as_ref()?;
+    eprintln!("parse: transport_hdr = {:?}", transport_hdr);
+    let src_port = match transport_hdr {
+        etherparse::TransportHeader::Udp(udp_hdr) => return None,
+        etherparse::TransportHeader::Tcp(tcp_hdr) => tcp_hdr.source_port,
+    };
+
+    Some(Target {
+        ip: src_ip,
+        port: src_port.into(),
+    })
+}
 
 pub fn recv(
     mut rx_q: RxQueue,
@@ -8,7 +31,7 @@ pub fn recv(
     mut frames: Vec<FrameDesc>,
     umem: Umem,
     done: Arc<AtomicBool>,
-) {
+) -> Vec<Target> {
     eprintln!("--------------------------");
     eprintln!(
         "rx frames[0] = {}, rx frames[-1] = {}",
@@ -20,6 +43,8 @@ pub fn recv(
 
     let poll_ms_timeout: i32 = 100;
     let mut total_frames_rcvd = 0;
+
+    let mut responders = vec![];
 
     while !(done.load(Ordering::Relaxed)) {
         eprintln!("starting rx loop");
@@ -54,6 +79,9 @@ pub fn recv(
                         Ok(value) => {
                             eprintln!("received frame in xdpscan rx loop:");
                             eprintln!("{:?}", value);
+                            if let Some(responder) = parse_response(&value) {
+                                responders.push(responder);
+                            }
                         }
                     }
                 }
@@ -79,4 +107,6 @@ pub fn recv(
             }
         }
     }
+
+    responders
 }

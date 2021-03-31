@@ -20,6 +20,7 @@ use xsk_rs::{
     BindFlags, LibbpfFlags, XdpFlags,
 };
 
+#[derive(Debug)]
 pub struct Target {
     pub ip: IpAddr,
     pub port: u16,
@@ -80,12 +81,10 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
     let tx_done = Arc::new(AtomicBool::new(false));
     let rx_done = tx_done.clone();
 
+    let recv_handle = thread::spawn(|| recv(rx_q, fq, rx_frames, rx_umem, rx_done));
+    thread::sleep(time::Duration::from_secs(1));
     let send_handle = thread::spawn(|| {
         send(targets, src_config, tx_q, cq, tx_frames, tx_umem);
-    });
-
-    let recv_handle = thread::spawn(|| {
-        recv(rx_q, fq, rx_frames, rx_umem, rx_done);
     });
 
     send_handle.join().unwrap();
@@ -93,5 +92,9 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
     thread::sleep(time::Duration::from_secs(wait_time_secs));
     tx_done.store(true, Ordering::Relaxed);
 
-    recv_handle.join().unwrap();
+    let responders = recv_handle.join().unwrap();
+    eprintln!("{:?}", responders);
+    for responder in responders {
+        eprintln!("{:?}", responder);
+    }
 }
