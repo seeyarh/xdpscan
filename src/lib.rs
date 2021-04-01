@@ -9,6 +9,8 @@ use std::num::NonZeroU32;
 use std::sync::atomic::AtomicBool;
 use std::time;
 
+use std::collections::HashSet;
+use std::iter::FromIterator;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
@@ -20,7 +22,7 @@ use xsk_rs::{
     BindFlags, LibbpfFlags, XdpFlags,
 };
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub struct Target {
     pub ip: IpAddr,
     pub port: u16,
@@ -33,7 +35,20 @@ pub struct SrcConfig {
     pub src_port: u16,
 }
 
-pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
+fn validate_responders(targets: Vec<Target>, responders: Vec<Target>) -> Vec<Target> {
+    let targets: HashSet<&Target> = HashSet::from_iter(targets.iter());
+
+    let mut validated_responders = vec![];
+    for responder in responders {
+        if targets.contains(&responder) {
+            validated_responders.push(responder);
+        }
+    }
+
+    validated_responders
+}
+
+pub fn scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) -> Vec<Target> {
     let rx_q_size: u32 = 4096;
     let tx_q_size: u32 = 4096;
     let comp_q_size: u32 = 4096;
@@ -83,8 +98,9 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
 
     let recv_handle = thread::spawn(|| recv(rx_q, fq, rx_frames, rx_umem, rx_done));
     thread::sleep(time::Duration::from_secs(1));
+    let targets_2 = targets.clone();
     let send_handle = thread::spawn(|| {
-        send(targets, src_config, tx_q, cq, tx_frames, tx_umem);
+        send(targets_2, src_config, tx_q, cq, tx_frames, tx_umem);
     });
 
     send_handle.join().unwrap();
@@ -93,8 +109,5 @@ pub fn start_scan(ifname: &str, src_config: SrcConfig, targets: Vec<Target>) {
     tx_done.store(true, Ordering::Relaxed);
 
     let responders = recv_handle.join().unwrap();
-    eprintln!("{:?}", responders);
-    for responder in responders {
-        eprintln!("{:?}", responder);
-    }
+    validate_responders(targets, responders)
 }

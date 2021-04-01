@@ -218,7 +218,8 @@ fn run_test(veth_link: &VethLink) -> Result<(), Box<dyn Error>> {
         src_ip,
         src_port,
     };
-    xdpscan::start_scan(&veth_link.dev1_if_name, src_config, targets);
+    let responders = xdpscan::scan(&veth_link.dev1_if_name, src_config, targets.clone());
+    assert_eq!(responders.len(), targets.len());
 
     recv_handle.join().expect("failed to join recv handle");
     Ok(())
@@ -237,6 +238,5 @@ fn tx_rx_test() -> Result<(), Box<dyn Error>> {
     let (veth_link, mut rt) = setup_veth(&veth_config);
     let passed = run_test(&veth_link);
     cleanup_veth(&veth_link, &mut rt);
-    assert!(false);
     passed
 }
